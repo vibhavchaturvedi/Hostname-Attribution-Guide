@@ -1,0 +1,225 @@
+# Splunk SPL Detection Rules
+# Hostname Attribution for Malicious Network Connections
+
+# ============================================
+# 1. DGA Domain Detection
+# Detects potential Domain Generation Algorithm domains
+# ============================================
+
+index=dns earliest=-24h
+| rex field=query "^(?<subdomain>[^.]+)\.(?<domain>[^.]+)\.(?<tld>[^.]+)$"
+| eval domain_length = len(domain)
+| where domain_length > 15
+| eval char_array = split(lower(domain), "")
+| mvexpand char_array
+| stats count by query, char_array, domain_length, src_ip
+| eventstats sum(count) as total_chars by query
+| eval freq = count / total_chars
+| eval entropy_component = if(freq > 0, freq * ln(freq) / ln(2), 0)
+| stats sum(entropy_component) as neg_entropy, values(src_ip) as clients, dc(src_ip) as unique_clients by query, domain_length
+| eval entropy = -neg_entropy
+| where entropy > 3.5
+| where NOT match(query, "\.(microsoft|windows|google|amazonaws|cloudfront)\.com$")
+| table query, entropy, domain_length, unique_clients, clients
+| sort - entropy
+
+# ============================================
+# 2. DNS Tunneling Detection - Long Subdomains
+# Detects potential DNS tunneling based on subdomain length
+# ============================================
+
+index=dns earliest=-24h
+| rex field=query "^(?<subdomain>[^.]+)\.(?<base_domain>.+)$"
+| eval subdomain_length = len(subdomain)
+| where subdomain_length > 30 OR query_type IN ("TXT", "NULL", "CNAME")
+| stats 
+    count as query_count,
+    avg(subdomain_length) as avg_subdomain_length,
+    max(subdomain_length) as max_subdomain_length,
+    dc(subdomain) as unique_subdomains,
+    sum(if(query_type="TXT", 1, 0)) as txt_count
+    by src_ip, base_domain
+| where query_count > 50 OR unique_subdomains > 20 OR txt_count > 10
+| table src_ip, base_domain, query_count, unique_subdomains, avg_subdomain_length, txt_count
+| sort - query_count
+
+# ============================================
+# 3. C2 Beaconing Detection
+# Detects regular, periodic communication patterns
+# ============================================
+
+index=dns earliest=-24h
+| sort 0 src_ip, query, _time
+| streamstats current=f last(_time) as prev_time by src_ip, query
+| eval time_delta = _time - prev_time
+| where time_delta > 0 AND time_delta < 3600
+| stats 
+    count as connection_count,
+    avg(time_delta) as avg_interval,
+    stdev(time_delta) as stdev_interval,
+    min(_time) as first_seen,
+    max(_time) as last_seen
+    by src_ip, query
+| where connection_count >= 50
+| eval jitter_percent = (stdev_interval / avg_interval) * 100
+| where jitter_percent < 25
+| eval beacon_score = 100 - jitter_percent
+| eval duration_hours = (last_seen - first_seen) / 3600
+| where duration_hours >= 4
+| table src_ip, query, connection_count, avg_interval, jitter_percent, beacon_score, first_seen, last_seen
+| sort - beacon_score
+
+# ============================================
+# 4. Sinkhole Hit Detection
+# Detects queries resolving to sinkhole IPs
+# ============================================
+
+index=dns earliest=-24h
+| where answer IN ("127.0.0.1", "0.0.0.0", "10.0.0.100", "192.0.2.1")
+| stats 
+    count as hit_count,
+    dc(query) as unique_domains,
+    values(query) as domains,
+    min(_time) as first_hit,
+    max(_time) as last_hit
+    by src_ip
+| table src_ip, hit_count, unique_domains, domains, first_hit, last_hit
+| sort - hit_count
+
+# ============================================
+# 5. First-Seen Domain Detection
+# Detects queries to domains not seen in baseline
+# ============================================
+
+index=dns earliest=-24h latest=-1h
+| stats count by query
+| outputlookup dns_baseline.csv
+
+index=dns earliest=-1h
+| lookup dns_baseline.csv query OUTPUT count as baseline_count
+| where isnull(baseline_count)
+| where NOT match(query, "\.(microsoft|windows|google|azure)\.com$")
+| stats 
+    count as query_count,
+    dc(src_ip) as unique_clients,
+    values(src_ip) as clients
+    by query
+| where unique_clients <= 3
+| table query, query_count, unique_clients, clients
+| sort - query_count
+
+# ============================================
+# 6. Suspicious Process DNS Query (Sysmon)
+# Detects DNS queries from suspicious processes
+# ============================================
+
+index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=22
+| rex field=Image "(?<process_name>[^\\\\]+)$"
+| where process_name IN ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe", "certutil.exe")
+    OR match(QueryName, "\.(tk|xyz|top|pw|cc|su)$")
+| table _time, ComputerName, User, process_name, Image, QueryName
+| sort - _time
+
+# ============================================
+# 7. Dynamic DNS Provider Detection
+# Detects queries to dynamic DNS services
+# ============================================
+
+index=dns earliest=-24h
+| where match(query, "(dyndns|no-ip|duckdns|changeip|freedns|afraid\.org|hopto\.org|zapto\.org|sytes\.net|ddns\.net)")
+| stats 
+    count as query_count,
+    dc(src_ip) as unique_clients,
+    values(src_ip) as clients
+    by query
+| table query, query_count, unique_clients, clients
+| sort - query_count
+
+# ============================================
+# 8. Large Data Transfer Detection
+# Detects potential data exfiltration
+# ============================================
+
+index=firewall action=allow earliest=-24h
+| where NOT cidrmatch("10.0.0.0/8", dest_ip) AND NOT cidrmatch("192.168.0.0/16", dest_ip) AND NOT cidrmatch("172.16.0.0/12", dest_ip)
+| bin _time span=1h
+| stats 
+    sum(bytes_out) as total_bytes_sent,
+    count as connection_count,
+    dc(dest_ip) as unique_destinations,
+    values(dest_ip) as destinations
+    by src_ip, _time
+| eval total_mb_sent = total_bytes_sent / (1024 * 1024)
+| where total_mb_sent > 100
+| table _time, src_ip, total_mb_sent, connection_count, unique_destinations, destinations
+| sort - total_mb_sent
+
+# ============================================
+# 9. DNS-to-Connection Correlation
+# Correlates DNS queries with subsequent connections
+# ============================================
+
+index=dns earliest=-24h
+| rename src_ip as dns_client, answer as resolved_ip
+| table _time, dns_client, query, resolved_ip
+| join type=left resolved_ip 
+    [search index=firewall action=allow earliest=-24h
+    | rename dest_ip as resolved_ip, src_ip as conn_client
+    | table _time, conn_client, resolved_ip, dest_port]
+| where dns_client = conn_client
+| eval time_diff = abs(_time - _time)
+| where time_diff < 300
+| table dns_client, query, resolved_ip, dest_port, time_diff
+| dedup dns_client, query, resolved_ip
+
+# ============================================
+# 10. Rare User-Agent Detection
+# Detects unusual user-agents in proxy logs
+# ============================================
+
+index=proxy earliest=-7d
+| stats count as total by http_user_agent
+| sort + total
+| head 100
+| eval rarity = "rare"
+| join type=left http_user_agent 
+    [search index=proxy earliest=-24h
+    | stats count as recent_count, dc(src_ip) as unique_clients by http_user_agent]
+| where recent_count > 0
+| table http_user_agent, total, recent_count, unique_clients, rarity
+| sort - recent_count
+
+# ============================================
+# 11. Process Network Connection with Host Attribution
+# Full process-to-network attribution (Sysmon Event ID 3)
+# ============================================
+
+index=wineventlog sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=3
+| rex field=Image "(?<process_name>[^\\\\]+)$"
+| where NOT cidrmatch("127.0.0.0/8", DestinationIp) 
+    AND NOT cidrmatch("10.0.0.0/8", DestinationIp) 
+    AND NOT cidrmatch("192.168.0.0/16", DestinationIp) 
+    AND NOT cidrmatch("172.16.0.0/12", DestinationIp)
+| stats 
+    count as connection_count,
+    dc(DestinationIp) as unique_destinations,
+    values(DestinationIp) as destinations,
+    values(DestinationPort) as ports
+    by ComputerName, User, process_name, Image
+| where connection_count > 10
+| table ComputerName, User, process_name, Image, connection_count, unique_destinations, destinations, ports
+| sort - connection_count
+
+# ============================================
+# 12. DNS Query Volume Anomaly
+# Detects hosts with abnormal DNS query volumes
+# ============================================
+
+index=dns earliest=-24h
+| bin _time span=1h
+| stats count as query_count by src_ip, _time
+| eventstats avg(query_count) as avg_queries, stdev(query_count) as stdev_queries by src_ip
+| eval zscore = (query_count - avg_queries) / stdev_queries
+| where zscore > 3
+| table _time, src_ip, query_count, avg_queries, zscore
+| sort - zscore

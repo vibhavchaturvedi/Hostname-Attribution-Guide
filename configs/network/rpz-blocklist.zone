@@ -1,0 +1,130 @@
+; /var/named/rpz/blocklist.zone
+; DNS Response Policy Zone for Malicious Domain Blocking
+;
+; Purpose: Block known malicious domains and log access attempts
+; Update: Replace YYYYMMDDNN with current date and serial
+;
+; Actions:
+;   CNAME .          = NXDOMAIN (domain doesn't exist)
+;   CNAME *.         = NODATA (exists but no records)
+;   CNAME rpz-drop.  = Silently drop query
+;   CNAME rpz-passthru. = Allow through (whitelist)
+;   A 10.0.0.100     = Redirect to sinkhole server
+
+$TTL 60
+$ORIGIN blocklist.rpz.
+
+@   IN  SOA  localhost. admin.localhost. (
+        2025120901  ; Serial (YYYYMMDDNN)
+        1H          ; Refresh
+        15M         ; Retry
+        1W          ; Expire
+        1H          ; Minimum TTL
+    )
+
+@   IN  NS   localhost.
+
+; ============================================
+; Sinkhole IP Configuration
+; Change this to your sinkhole server IP
+; ============================================
+; Sinkhole server should log all connection attempts
+; for attribution purposes
+
+; ============================================
+; Known Malicious Domains - Block (NXDOMAIN)
+; ============================================
+
+; Example malware C2 domains (replace with actual IOCs)
+malicious-c2-example.com        CNAME .
+*.malicious-c2-example.com      CNAME .
+
+bad-domain-example.net          CNAME .
+*.bad-domain-example.net        CNAME .
+
+; ============================================
+; Suspicious Domains - Redirect to Sinkhole
+; ============================================
+; These domains will resolve to your sinkhole server
+; Log connections for attribution
+
+suspicious-domain.com           A     10.0.0.100
+*.suspicious-domain.com         A     10.0.0.100
+
+; ============================================
+; Dynamic DNS Providers (Optional - Monitor)
+; ============================================
+; Uncomment to redirect dynamic DNS to sinkhole
+; Be cautious - may impact legitimate use
+
+; dyndns.org                    A     10.0.0.100
+; *.dyndns.org                  A     10.0.0.100
+; no-ip.com                     A     10.0.0.100
+; *.no-ip.com                   A     10.0.0.100
+
+; ============================================
+; Suspicious TLDs (Optional - Block or Monitor)
+; ============================================
+; Wildcard blocks for entire TLDs
+; Use with caution - may cause false positives
+
+; Block .bit (alternative DNS, often malicious)
+; *.bit                         CNAME .
+
+; Monitor .tk, .xyz (high abuse rate)
+; *.tk                          A     10.0.0.100
+; *.xyz                         A     10.0.0.100
+
+; ============================================
+; Known Good Domains - Whitelist
+; ============================================
+; Use rpz-passthru to explicitly allow domains
+; that might match other rules
+
+microsoft.com                   CNAME rpz-passthru.
+*.microsoft.com                 CNAME rpz-passthru.
+
+google.com                      CNAME rpz-passthru.
+*.google.com                    CNAME rpz-passthru.
+
+; ============================================
+; DoH/DoT Blocking (Optional)
+; ============================================
+; Block DNS over HTTPS providers to maintain visibility
+; Uncomment carefully - may break some applications
+
+; dns.google                    CNAME .
+; cloudflare-dns.com            CNAME .
+; dns.quad9.net                 CNAME .
+
+; Firefox canary domain (returning NXDOMAIN disables DoH)
+use-application-dns.net         CNAME .
+
+; ============================================
+; Threat Intelligence Feed Integration
+; ============================================
+; Add entries from threat intel feeds below
+; Format: domain.tld CNAME .
+; Or: domain.tld A <sinkhole-ip>
+
+; --- BEGIN THREAT INTEL ---
+; Add IOCs from your threat intelligence feeds here
+; --- END THREAT INTEL ---
+
+; ============================================
+; IP-Based Blocking (Optional)
+; ============================================
+; Block reverse lookups to known bad IPs
+; Format: <reversed-ip>.rpz-ip CNAME .
+
+; Example: Block 192.0.2.1
+; 1.2.0.192.rpz-ip             CNAME .
+
+; ============================================
+; Client IP Policies (Optional)
+; ============================================
+; Apply different policies based on client IP
+; Format: <client-ip>.rpz-client-ip
+
+; Example: Block all DNS for specific client
+; 24.0.168.192.rpz-client-ip   CNAME .

@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Windows Event Forwarding Subscription for DNS and Network Events
+  
+  Purpose: Collect DNS queries and network connection events from endpoints
+  
+  Deployment:
+    1. Configure collector: winrm quickconfig
+    2. Import subscription: wecutil cs wef-subscription.xml
+    3. Enable: wecutil ss DNSandNetwork /e:true
+    4. Configure sources via GPO (see gpo-settings.md)
+-->
+<Subscription xmlns="http://schemas.microsoft.com/2006/03/windows/events/subscription">
+  <SubscriptionId>DNSandNetwork</SubscriptionId>
+  <SubscriptionType>SourceInitiated</SubscriptionType>
+  <Description>Collect DNS queries (Sysmon 22) and network connections (Security 5156) for hostname attribution</Description>
+  <Enabled>true</Enabled>
+  <Uri>http://schemas.microsoft.com/wbem/wsman/1/windows/EventLog</Uri>
+  
+  <!-- Normal delivery for real-time visibility -->
+  <ConfigurationMode>Normal</ConfigurationMode>
+  
+  <Delivery Mode="Push">
+    <Batching>
+      <MaxItems>10</MaxItems>
+      <MaxLatencyTime>30000</MaxLatencyTime>
+    </Batching>
+    <PushSettings>
+      <Heartbeat Interval="3600000"/>
+    </PushSettings>
+  </Delivery>
+  
+  <Query>
+    <![CDATA[
+    <QueryList>
+      <!-- Sysmon DNS Query Events (Event ID 22) -->
+      <Query Id="0" Path="Microsoft-Windows-Sysmon/Operational">
+        <Select Path="Microsoft-Windows-Sysmon/Operational">
+          *[System[(EventID=22)]]
+        </Select>
+      </Query>
+      
+      <!-- Sysmon Network Connection Events (Event ID 3) -->
+      <Query Id="1" Path="Microsoft-Windows-Sysmon/Operational">
+        <Select Path="Microsoft-Windows-Sysmon/Operational">
+          *[System[(EventID=3)]]
+        </Select>
+      </Query>
+      
+      <!-- Sysmon Process Creation (Event ID 1) - for context -->
+      <Query Id="2" Path="Microsoft-Windows-Sysmon/Operational">
+        <Select Path="Microsoft-Windows-Sysmon/Operational">
+          *[System[(EventID=1)]]
+        </Select>
+      </Query>
+      
+      <!-- Windows Filtering Platform - Connection Permitted (Event ID 5156) -->
+      <Query Id="3" Path="Security">
+        <Select Path="Security">
+          *[System[(EventID=5156)]]
+        </Select>
+      </Query>
+      
+      <!-- Windows Filtering Platform - Connection Blocked (Event ID 5157) -->
+      <Query Id="4" Path="Security">
+        <Select Path="Security">
+          *[System[(EventID=5157)]]
+        </Select>
+      </Query>
+      
+      <!-- DNS Client Events -->
+      <Query Id="5" Path="Microsoft-Windows-DNS-Client/Operational">
+        <Select Path="Microsoft-Windows-DNS-Client/Operational">
+          *[System[(EventID=3008)]]
+        </Select>
+      </Query>
+    </QueryList>
+    ]]>
+  </Query>
+  
+  <ReadExistingEvents>false</ReadExistingEvents>
+  <TransportName>http</TransportName>
+  <ContentFormat>RenderedText</ContentFormat>
+  <Locale Language="en-US"/>
+  <LogFile>ForwardedEvents</LogFile>
+  
+  <!-- 
+    AllowedSourceNonDomainComputers and AllowedSourceDomainComputers
+    Define which computers can forward events.
+    Use 'O:NSG:NSD:(A;;GA;;;DC)(A;;GA;;;NS)' for domain computers
+  -->
+  <AllowedSourceDomainComputers>O:NSG:NSD:(A;;GA;;;DC)(A;;GA;;;NS)</AllowedSourceDomainComputers>
+</Subscription>

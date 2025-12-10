@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sysmon Configuration for DNS and Network Monitoring
+  
+  Purpose: Capture DNS queries and network connections with process attribution
+  Version: 1.0
+  Last Updated: 2025-12-09
+  
+  Installation:
+    sysmon.exe -accepteula -i sysmon-dns.xml
+  
+  Update existing:
+    sysmon.exe -c sysmon-dns.xml
+-->
+<Sysmon schemaversion="4.90">
+  
+  <HashAlgorithms>SHA256,IMPHASH</HashAlgorithms>
+  <CheckRevocation>false</CheckRevocation>
+  
+  <EventFiltering>
+    
+    <!-- ============================================== -->
+    <!-- Event ID 1: Process Creation                   -->
+    <!-- Needed for process context correlation         -->
+    <!-- ============================================== -->
+    <RuleGroup name="Process Creation" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <!-- High-volume, low-value processes -->
+        <Image condition="end with">\RuntimeBroker.exe</Image>
+        <Image condition="end with">\backgroundTaskHost.exe</Image>
+        <Image condition="end with">\SearchProtocolHost.exe</Image>
+        <Image condition="end with">\SearchFilterHost.exe</Image>
+        <Image condition="end with">\SgrmBroker.exe</Image>
+        <Image condition="end with">\MsMpEng.exe</Image>
+        <Image condition="end with">\NisSrv.exe</Image>
+        <!-- Noisy system processes -->
+        <ParentImage condition="end with">\SgrmBroker.exe</ParentImage>
+        <ParentImage condition="end with">\MsMpEng.exe</ParentImage>
+      </ProcessCreate>
+    </RuleGroup>
+    
+    <!-- ============================================== -->
+    <!-- Event ID 3: Network Connection                 -->
+    <!-- Captures TCP/UDP connections with process info -->
+    <!-- ============================================== -->
+    <RuleGroup name="Network Connections" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <!-- Localhost connections -->
+        <DestinationIp condition="is">127.0.0.1</DestinationIp>
+        <DestinationIp condition="begin with">169.254.</DestinationIp>
+        <SourceIp condition="is">127.0.0.1</SourceIp>
+        
+        <!-- Known Microsoft services (tune based on environment) -->
+        <Image condition="end with">\MsMpEng.exe</Image>
+        <Image condition="end with">\svchost.exe</Image>
+        <DestinationPort condition="is">5355</DestinationPort> <!-- LLMNR -->
+        
+        <!-- Multicast -->
+        <DestinationIp condition="begin with">224.</DestinationIp>
+        <DestinationIp condition="begin with">239.</DestinationIp>
+        <DestinationIp condition="begin with">ff</DestinationIp>
+      </NetworkConnect>
+    </RuleGroup>
+    
+    <!-- Include suspicious network connections -->
+    <RuleGroup name="Suspicious Network" groupRelation="or">
+      <NetworkConnect onmatch="include">
+        <!-- PowerShell network activity -->
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        
+        <!-- Script hosts -->
+        <Image condition="end with">\wscript.exe</Image>
+        <Image condition="end with">\cscript.exe</Image>
+        <Image condition="end with">\mshta.exe</Image>
+        
+        <!-- LOLBins -->
+        <Image condition="end with">\regsvr32.exe</Image>
+        <Image condition="end with">\rundll32.exe</Image>
+        <Image condition="end with">\msiexec.exe</Image>
+        <Image condition="end with">\certutil.exe</Image>
+        <Image condition="end with">\bitsadmin.exe</Image>
+        
+        <!-- Non-standard ports -->
+        <DestinationPort condition="is">4444</DestinationPort>
+        <DestinationPort condition="is">5555</DestinationPort>
+        <DestinationPort condition="is">6666</DestinationPort>
+        <DestinationPort condition="is">31337</DestinationPort>
+        <DestinationPort condition="is">8080</DestinationPort>
+        <DestinationPort condition="is">8443</DestinationPort>
+      </NetworkConnect>
+    </RuleGroup>
+    
+    <!-- ============================================== -->
+    <!-- Event ID 22: DNS Query                         -->
+    <!-- Primary event for DNS hostname attribution     -->
+    <!-- ============================================== -->
+    <RuleGroup name="DNS Query Logging" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <!-- High-volume legitimate Microsoft domains -->
+        <QueryName condition="end with">.microsoft.com</QueryName>
+        <QueryName condition="end with">.windows.com</QueryName>
+        <QueryName condition="end with">.windowsupdate.com</QueryName>
+        <QueryName condition="end with">.msftncsi.com</QueryName>
+        <QueryName condition="end with">.msftconnecttest.com</QueryName>
+        <QueryName condition="end with">.digicert.com</QueryName>
+        <QueryName condition="end with">.verisign.com</QueryName>
+        
+        <!-- Windows name resolution noise -->
+        <QueryName condition="is">wpad</QueryName>
+        <QueryName condition="is">isatap</QueryName>
+        <QueryName condition="end with">.local</QueryName>
+        <QueryName condition="end with">.localdomain</QueryName>
+        <QueryName condition="end with">.internal</QueryName>
+        
+        <!-- Common CDNs (tune based on environment) -->
+        <QueryName condition="end with">.akamaiedge.net</QueryName>
+        <QueryName condition="end with">.akamai.net</QueryName>
+        <QueryName condition="end with">.cloudfront.net</QueryName>
+        <QueryName condition="end with">.googleapis.com</QueryName>
+        <QueryName condition="end with">.gstatic.com</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+    
+    <!-- Include suspicious DNS queries -->
+    <RuleGroup name="Suspicious DNS" groupRelation="or">
+      <DnsQuery onmatch="include">
+        <!-- Suspicious TLDs -->
+        <QueryName condition="end with">.tk</QueryName>
+        <QueryName condition="end with">.xyz</QueryName>
+        <QueryName condition="end with">.top</QueryName>
+        <QueryName condition="end with">.pw</QueryName>
+        <QueryName condition="end with">.cc</QueryName>
+        <QueryName condition="end with">.su</QueryName>
+        <QueryName condition="end with">.bit</QueryName>
+        <QueryName condition="end with">.onion</QueryName>
+        
+        <!-- Dynamic DNS providers -->
+        <QueryName condition="contains">dyndns</QueryName>
+        <QueryName condition="contains">no-ip</QueryName>
+        <QueryName condition="contains">duckdns</QueryName>
+        <QueryName condition="contains">changeip</QueryName>
+        <QueryName condition="contains">freedns</QueryName>
+        
+        <!-- Pastebin and similar -->
+        <QueryName condition="contains">pastebin</QueryName>
+        <QueryName condition="contains">paste.</QueryName>
+        <QueryName condition="contains">hastebin</QueryName>
+        
+        <!-- Known C2 patterns -->
+        <QueryName condition="contains">ngrok</QueryName>
+        <QueryName condition="contains">portmap</QueryName>
+        <QueryName condition="contains">serveo</QueryName>
+        <QueryName condition="contains">localhost.run</QueryName>
+        
+        <!-- Raw IP in hostname (DGA indicator) -->
+        <QueryName condition="begin with">0.</QueryName>
+        <QueryName condition="begin with">1.</QueryName>
+        <QueryName condition="begin with">2.</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+    
+    <!-- ============================================== -->
+    <!-- Event ID 10: Process Access                    -->
+    <!-- For credential theft detection                 -->
+    <!-- ============================================== -->
+    <RuleGroup name="LSASS Access" groupRelation="or">
+      <ProcessAccess onmatch="include">
+        <TargetImage condition="end with">\lsass.exe</TargetImage>
+      </ProcessAccess>
+    </RuleGroup>
+    
+    <!-- ============================================== -->
+    <!-- Event ID 11: File Creation                     -->
+    <!-- Track file drops                               -->
+    <!-- ============================================== -->
+    <RuleGroup name="File Creation" groupRelation="or">
+      <FileCreate onmatch="include">
+        <!-- Executables -->
+        <TargetFilename condition="end with">.exe</TargetFilename>
+        <TargetFilename condition="end with">.dll</TargetFilename>
+        <TargetFilename condition="end with">.sys</TargetFilename>
+        <TargetFilename condition="end with">.scr</TargetFilename>
+        
+        <!-- Scripts -->
+        <TargetFilename condition="end with">.ps1</TargetFilename>
+        <TargetFilename condition="end with">.vbs</TargetFilename>
+        <TargetFilename condition="end with">.js</TargetFilename>
+        <TargetFilename condition="end with">.hta</TargetFilename>
+        <TargetFilename condition="end with">.bat</TargetFilename>
+        <TargetFilename condition="end with">.cmd</TargetFilename>
+        
+        <!-- Suspicious locations -->
+        <TargetFilename condition="contains">\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\Downloads\</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+    
+  </EventFiltering>
+</Sysmon>

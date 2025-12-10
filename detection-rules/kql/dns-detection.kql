@@ -1,0 +1,236 @@
+// ============================================
+// KQL Detection Rules for Microsoft Sentinel
+// Hostname Attribution for Malicious Network Connections
+// ============================================
+
+// --------------------------------------------
+// 1. DGA Domain Detection
+// Detects potential Domain Generation Algorithm domains
+// --------------------------------------------
+let DGADetection = 
+    DnsEvents
+    | where TimeGenerated > ago(24h)
+    | extend DomainParts = split(Name, '.')
+    | extend SecondLevelDomain = tostring(DomainParts[-2])
+    | extend TLD = tostring(DomainParts[-1])
+    | where strlen(SecondLevelDomain) >= 15
+    // Calculate character frequency entropy approximation
+    | extend LowercaseDomain = tolower(SecondLevelDomain)
+    | extend ConsonantCount = countof(LowercaseDomain, '[bcdfghjklmnpqrstvwxyz]', 'regex')
+    | extend VowelCount = countof(LowercaseDomain, '[aeiou]', 'regex')
+    | extend NumberCount = countof(LowercaseDomain, '[0-9]', 'regex')
+    | extend DomainLength = strlen(SecondLevelDomain)
+    | extend ConsonantRatio = ConsonantCount * 1.0 / DomainLength
+    // DGA domains often have high consonant ratios
+    | where ConsonantRatio > 0.7 or NumberCount > 3
+    // Exclude known CDN patterns
+    | where not(Name has_any ('.amazonaws.com', '.cloudfront.net', '.azure.com', '.microsoft.com'))
+    | summarize 
+        QueryCount = count(),
+        UniqueClients = dcount(ClientIP),
+        Clients = make_set(ClientIP, 10),
+        FirstSeen = min(TimeGenerated),
+        LastSeen = max(TimeGenerated)
+        by Name, TLD
+    | where UniqueClients <= 3  // DGA typically queried by few hosts
+    | project Name, TLD, QueryCount, UniqueClients, Clients, FirstSeen, LastSeen
+    | order by QueryCount desc;
+DGADetection
+
+// --------------------------------------------
+// 2. DNS Tunneling Detection
+// Detects potential DNS tunneling based on query patterns
+// --------------------------------------------
+let DNSTunnelingDetection =
+    DnsEvents
+    | where TimeGenerated > ago(24h)
+    | extend DomainParts = split(Name, '.')
+    | extend SubdomainLength = strlen(tostring(DomainParts[0]))
+    | extend BaseDomain = strcat(tostring(DomainParts[-2]), '.', tostring(DomainParts[-1]))
+    | where SubdomainLength > 30 or QueryType in ('TXT', 'NULL', 'CNAME')
+    | summarize 
+        QueryCount = count(),
+        AvgSubdomainLength = avg(SubdomainLength),
+        MaxSubdomainLength = max(SubdomainLength),
+        UniqueSubdomains = dcount(tostring(DomainParts[0])),
+        TXTCount = countif(QueryType == 'TXT')
+        by ClientIP, BaseDomain, bin(TimeGenerated, 1h)
+    | where QueryCount > 50 or UniqueSubdomains > 20 or TXTCount > 10
+    | project TimeGenerated, ClientIP, BaseDomain, QueryCount, UniqueSubdomains, AvgSubdomainLength, TXTCount
+    | order by QueryCount desc;
+DNSTunnelingDetection
+
+// --------------------------------------------
+// 3. C2 Beaconing Detection
+// Detects regular, periodic communication patterns
+// --------------------------------------------
+let BeaconingDetection =
+    DnsEvents
+    | where TimeGenerated > ago(24h)
+    | project TimeGenerated, ClientIP, Name
+    | sort by ClientIP, Name, TimeGenerated asc
+    | extend PrevTime = prev(TimeGenerated, 1)
+    | extend PrevClientIP = prev(ClientIP, 1)
+    | extend PrevName = prev(Name, 1)
+    | where ClientIP == PrevClientIP and Name == PrevName
+    | extend TimeDeltaSeconds = datetime_diff('second', TimeGenerated, PrevTime)
+    | where TimeDeltaSeconds > 0 and TimeDeltaSeconds < 3600
+    | summarize 
+        ConnectionCount = count(),
+        AvgInterval = avg(TimeDeltaSeconds),
+        StdDevInterval = stdev(TimeDeltaSeconds),
+        MinInterval = min(TimeDeltaSeconds),
+        MaxInterval = max(TimeDeltaSeconds),
+        FirstSeen = min(TimeGenerated),
+        LastSeen = max(TimeGenerated)
+        by ClientIP, Name
+    | where ConnectionCount >= 50
+    | extend JitterPercent = iff(AvgInterval > 0, (StdDevInterval / AvgInterval) * 100, 100)
+    | where JitterPercent < 25  // Low jitter indicates beaconing
+    | extend DurationHours = datetime_diff('hour', LastSeen, FirstSeen)
+    | where DurationHours >= 4
+    | extend BeaconScore = 100 - JitterPercent
+    | project ClientIP, Name, ConnectionCount, AvgInterval, JitterPercent, BeaconScore, FirstSeen, LastSeen
+    | order by BeaconScore desc;
+BeaconingDetection
+
+// --------------------------------------------
+// 4. Sinkhole Hit Detection
+// Detects queries resolving to sinkhole IPs
+// --------------------------------------------
+let SinkholeIPs = dynamic(['127.0.0.1', '0.0.0.0', '10.0.0.100', '192.0.2.1']);
+
+let SinkholeHitDetection =
+    DnsEvents
+    | where TimeGenerated > ago(24h)
+    | where IPAddresses has_any (SinkholeIPs)
+    | summarize 
+        HitCount = count(),
+        UniqueQueries = dcount(Name),
+        Domains = make_set(Name, 50),
+        FirstHit = min(TimeGenerated),
+        LastHit = max(TimeGenerated)
+        by ClientIP
+    | project ClientIP, HitCount, UniqueQueries, Domains, FirstHit, LastHit
+    | order by HitCount desc;
+SinkholeHitDetection
+
+// --------------------------------------------
+// 5. First-Seen Domain Detection
+// Detects queries to domains not seen in baseline
+// --------------------------------------------
+let LookbackDays = 30;
+let AlertWindow = 1h;
+
+let HistoricalDomains = 
+    DnsEvents
+    | where TimeGenerated between (ago(LookbackDays) .. ago(AlertWindow))
+    | distinct Name;
+
+let FirstSeenDomains =
+    DnsEvents
+    | where TimeGenerated > ago(AlertWindow)
+    | where Name !in (HistoricalDomains)
+    | where not(Name has_any ('.microsoft.com', '.windows.com', '.google.com', '.azure.com'))
+    | summarize 
+        QueryCount = count(),
+        UniqueClients = dcount(ClientIP),
+        Clients = make_set(ClientIP, 10)
+        by Name
+    | where UniqueClients <= 3
+    | project Name, QueryCount, UniqueClients, Clients
+    | order by QueryCount desc;
+FirstSeenDomains
+
+// --------------------------------------------
+// 6. Suspicious Process DNS Query (Sysmon)
+// Detects DNS queries from suspicious processes
+// --------------------------------------------
+let SuspiciousProcesses = dynamic(['powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe', 'regsvr32.exe', 'rundll32.exe', 'certutil.exe']);
+let SuspiciousTLDs = dynamic(['.tk', '.xyz', '.top', '.pw', '.cc', '.su']);
+
+let SuspiciousProcessDNS =
+    Event
+    | where Source == "Microsoft-Windows-Sysmon"
+    | where EventID == 22  // DNS Query
+    | extend EventData = parse_xml(EventData)
+    | extend 
+        QueryName = tostring(EventData.DataItem.EventData.Data[4]["#text"]),
+        Image = tostring(EventData.DataItem.EventData.Data[3]["#text"]),
+        ProcessId = tostring(EventData.DataItem.EventData.Data[2]["#text"])
+    | extend ProcessName = tostring(split(Image, '\\')[-1])
+    | where ProcessName in~ (SuspiciousProcesses) or QueryName has_any (SuspiciousTLDs)
+    | project TimeGenerated, Computer, ProcessName, Image, QueryName, ProcessId
+    | order by TimeGenerated desc;
+SuspiciousProcessDNS
+
+// --------------------------------------------
+// 7. Dynamic DNS Provider Detection
+// Detects queries to dynamic DNS services
+// --------------------------------------------
+let DynamicDNSProviders = dynamic(['dyndns', 'no-ip', 'duckdns', 'changeip', 'freedns', 'afraid.org', 'hopto.org', 'zapto.org', 'sytes.net', 'ddns.net']);
+
+let DynamicDNSDetection =
+    DnsEvents
+    | where TimeGenerated > ago(24h)
+    | where Name has_any (DynamicDNSProviders)
+    | summarize 
+        QueryCount = count(),
+        UniqueClients = dcount(ClientIP),
+        Clients = make_set(ClientIP, 20)
+        by Name
+    | project Name, QueryCount, UniqueClients, Clients
+    | order by QueryCount desc;
+DynamicDNSDetection
+
+// --------------------------------------------
+// 8. Large Data Transfer Detection
+// Detects potential data exfiltration
+// --------------------------------------------
+let ThresholdMB = 100;
+
+let LargeDataTransfer =
+    CommonSecurityLog
+    | where TimeGenerated > ago(24h)
+    | where DeviceAction == "allow"
+    | where DestinationIP !startswith "10." and DestinationIP !startswith "192.168." and DestinationIP !startswith "172."
+    | summarize 
+        TotalBytesSent = sum(SentBytes),
+        ConnectionCount = count(),
+        UniqueDestinations = dcount(DestinationIP),
+        Destinations = make_set(DestinationIP, 10)
+        by SourceIP, bin(TimeGenerated, 1h)
+    | extend TotalMBSent = TotalBytesSent / (1024 * 1024)
+    | where TotalMBSent > ThresholdMB
+    | project TimeGenerated, SourceIP, TotalMBSent, ConnectionCount, UniqueDestinations, Destinations
+    | order by TotalMBSent desc;
+LargeDataTransfer
+
+// --------------------------------------------
+// 9. DNS Query with Process Correlation
+// Correlates DNS queries with process execution
+// --------------------------------------------
+let DNSProcessCorrelation =
+    Event
+    | where Source == "Microsoft-Windows-Sysmon"
+    | where EventID == 22
+    | extend EventData = parse_xml(EventData)
+    | extend 
+        QueryName = tostring(EventData.DataItem.EventData.Data[4]["#text"]),
+        Image = tostring(EventData.DataItem.EventData.Data[3]["#text"]),
+        User = tostring(EventData.DataItem.EventData.Data[8]["#text"]),
+        ProcessGuid = tostring(EventData.DataItem.EventData.Data[1]["#text"])
+    | project TimeGenerated, Computer, User, Image, QueryName, ProcessGuid
+    | join kind=leftouter (
+        Event
+        | where Source == "Microsoft-Windows-Sysmon"
+        | where EventID == 1
+        | extend EventData = parse_xml(EventData)
+        | extend 
+            ProcessGuid = tostring(EventData.DataItem.EventData.Data[1]["#text"]),
+            CommandLine = tostring(EventData.DataItem.EventData.Data[9]["#text"]),
+            ParentImage = tostring(EventData.DataItem.EventData.Data[20]["#text"])
+        | project ProcessGuid, CommandLine, ParentImage
+    ) on ProcessGuid
+    | project TimeGenerated, Computer, User, Image, QueryName, CommandLine, ParentImage;
+DNSProcessCorrelation

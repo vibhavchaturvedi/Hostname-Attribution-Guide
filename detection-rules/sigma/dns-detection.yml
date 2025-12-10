@@ -1,0 +1,346 @@
+title: Potential DGA Domain Query
+id: 8f3c0a1d-5e7b-4c2f-9a8d-6b3e2f1c4d5a
+status: experimental
+description: |
+    Detects DNS queries to potential Domain Generation Algorithm (DGA) domains
+    based on domain length and suspicious patterns. DGA domains are algorithmically
+    generated and commonly used by malware for C2 communication.
+references:
+    - https://attack.mitre.org/techniques/T1568/002/
+author: Security Team
+date: 2025/12/09
+modified: 2025/12/09
+tags:
+    - attack.command_and_control
+    - attack.t1568.002
+logsource:
+    category: dns
+    product: any
+detection:
+    selection:
+        dns.question.type: 'A'
+    filter_legitimate_cdn:
+        dns.question.name|endswith:
+            - '.amazonaws.com'
+            - '.cloudfront.net'
+            - '.akamaiedge.net'
+            - '.akamai.net'
+            - '.azureedge.net'
+            - '.fastly.net'
+    filter_legitimate_services:
+        dns.question.name|endswith:
+            - '.microsoft.com'
+            - '.windows.com'
+            - '.google.com'
+            - '.googleapis.com'
+            - '.gstatic.com'
+            - '.apple.com'
+    filter_short_domains:
+        dns.question.name|re: '^[a-z0-9-]{1,12}\.[a-z]{2,6}$'
+    condition: selection and not filter_legitimate_cdn and not filter_legitimate_services and not filter_short_domains
+fields:
+    - dns.question.name
+    - source.ip
+    - dns.answers.data
+    - process.name
+    - process.executable
+falsepositives:
+    - CDN domains with random-looking subdomains
+    - Legitimate services using UUID-based subdomains
+    - Content delivery networks
+level: medium
+
+---
+title: Potential DNS Tunneling - Long Subdomain
+id: 2a1b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d
+status: experimental
+description: |
+    Detects potential DNS tunneling activity based on unusually long subdomain
+    labels. DNS tunneling encodes data in DNS queries, often resulting in
+    subdomains exceeding 30 characters.
+references:
+    - https://attack.mitre.org/techniques/T1071/004/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.command_and_control
+    - attack.exfiltration
+    - attack.t1071.004
+    - attack.t1048.003
+logsource:
+    category: dns
+    product: any
+detection:
+    selection_long_subdomain:
+        dns.question.name|re: '^[a-zA-Z0-9]{30,}\.'
+    condition: selection_long_subdomain
+fields:
+    - dns.question.name
+    - dns.question.type
+    - source.ip
+    - process.name
+falsepositives:
+    - DKIM records
+    - SPF lookups
+    - Legitimate services with encoded identifiers
+level: medium
+
+---
+title: Potential DNS Tunneling - High Volume TXT Queries
+id: 3b4c5d6e-7f8a-9b0c-1d2e-3f4a5b6c7d8e
+status: experimental
+description: |
+    Detects potential DNS tunneling through high volume of TXT record queries.
+    TXT records can hold larger payloads, making them attractive for data
+    exfiltration via DNS.
+references:
+    - https://attack.mitre.org/techniques/T1071/004/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.command_and_control
+    - attack.exfiltration
+    - attack.t1071.004
+logsource:
+    category: dns
+    product: any
+detection:
+    selection:
+        dns.question.type:
+            - 'TXT'
+            - 'NULL'
+    filter_legitimate:
+        dns.question.name|contains:
+            - '_dmarc.'
+            - '_spf.'
+            - '_domainkey.'
+            - 'google-site-verification'
+            - '_acme-challenge.'
+    condition: selection and not filter_legitimate
+fields:
+    - dns.question.name
+    - dns.question.type
+    - source.ip
+falsepositives:
+    - DMARC/DKIM/SPF lookups
+    - Let's Encrypt ACME challenges
+    - Domain verification records
+level: low
+
+---
+title: DNS Query to Sinkhole IP
+id: 4c5d6e7f-8a9b-0c1d-2e3f-4a5b6c7d8e9f
+status: stable
+description: |
+    Detects when a DNS query resolves to a known sinkhole IP address,
+    indicating the host attempted to contact a known malicious domain.
+    This is a high-confidence indicator of compromise.
+references:
+    - https://attack.mitre.org/techniques/T1071/004/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.command_and_control
+    - attack.t1071
+logsource:
+    category: dns
+    product: any
+detection:
+    selection:
+        dns.answers.data:
+            - '127.0.0.1'
+            - '0.0.0.0'
+            - '10.0.0.100'      # Example internal sinkhole
+            - '192.0.2.1'       # Documentation range
+            - '198.51.100.1'    # Documentation range
+    condition: selection
+fields:
+    - dns.question.name
+    - source.ip
+    - dns.answers.data
+    - process.name
+    - user.name
+falsepositives:
+    - Misconfigured DNS records
+    - Intentional localhost redirects
+level: high
+
+---
+title: PowerShell DNS Query to Suspicious TLD
+id: 5d6e7f8a-9b0c-1d2e-3f4a-5b6c7d8e9f0a
+status: experimental
+description: |
+    Detects PowerShell making DNS queries to suspicious top-level domains.
+    PowerShell is commonly abused by attackers for malware delivery and
+    C2 communication.
+references:
+    - https://attack.mitre.org/techniques/T1059/001/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.execution
+    - attack.t1059.001
+    - attack.command_and_control
+logsource:
+    product: windows
+    category: dns_query
+detection:
+    selection_process:
+        Image|endswith:
+            - '\powershell.exe'
+            - '\pwsh.exe'
+    selection_tld:
+        QueryName|endswith:
+            - '.tk'
+            - '.xyz'
+            - '.top'
+            - '.pw'
+            - '.cc'
+            - '.su'
+            - '.bit'
+            - '.onion'
+    condition: selection_process and selection_tld
+fields:
+    - Image
+    - QueryName
+    - User
+    - Computer
+    - ProcessId
+falsepositives:
+    - Legitimate PowerShell scripts accessing services on these TLDs
+    - Security testing
+level: high
+
+---
+title: Suspicious Process Network Connection
+id: 6e7f8a9b-0c1d-2e3f-4a5b-6c7d8e9f0a1b
+status: experimental
+description: |
+    Detects network connections from processes commonly abused by attackers
+    including LOLBins and scripting engines.
+references:
+    - https://attack.mitre.org/techniques/T1059/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.execution
+    - attack.command_and_control
+logsource:
+    product: windows
+    category: network_connection
+detection:
+    selection_lolbins:
+        Image|endswith:
+            - '\regsvr32.exe'
+            - '\rundll32.exe'
+            - '\mshta.exe'
+            - '\certutil.exe'
+            - '\bitsadmin.exe'
+            - '\msiexec.exe'
+    selection_scripting:
+        Image|endswith:
+            - '\wscript.exe'
+            - '\cscript.exe'
+            - '\powershell.exe'
+            - '\pwsh.exe'
+    filter_local:
+        DestinationIp|startswith:
+            - '127.'
+            - '10.'
+            - '192.168.'
+            - '172.16.'
+            - '172.17.'
+            - '172.18.'
+            - '172.19.'
+            - '172.2'
+            - '172.30.'
+            - '172.31.'
+    condition: (selection_lolbins or selection_scripting) and not filter_local
+fields:
+    - Image
+    - DestinationIp
+    - DestinationPort
+    - User
+    - Computer
+falsepositives:
+    - Legitimate administrative scripts
+    - Software installations
+    - System management tools
+level: medium
+
+---
+title: DNS Query to Dynamic DNS Provider
+id: 7f8a9b0c-1d2e-3f4a-5b6c-7d8e9f0a1b2c
+status: experimental
+description: |
+    Detects DNS queries to dynamic DNS providers, which are commonly abused
+    by attackers to host C2 infrastructure with easily changeable IPs.
+references:
+    - https://attack.mitre.org/techniques/T1568/001/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.command_and_control
+    - attack.t1568.001
+logsource:
+    category: dns
+    product: any
+detection:
+    selection:
+        dns.question.name|contains:
+            - 'dyndns.'
+            - 'no-ip.'
+            - 'duckdns.'
+            - 'changeip.'
+            - 'freedns.'
+            - 'afraid.org'
+            - 'hopto.org'
+            - 'zapto.org'
+            - 'sytes.net'
+            - 'ddns.net'
+            - 'myftp.'
+            - 'serveftp.'
+            - 'servegame.'
+    condition: selection
+fields:
+    - dns.question.name
+    - source.ip
+    - process.name
+falsepositives:
+    - Legitimate use of dynamic DNS for home servers
+    - IoT devices
+    - Remote access tools
+level: low
+
+---
+title: First Seen Domain - Newly Registered
+id: 8a9b0c1d-2e3f-4a5b-6c7d-8e9f0a1b2c3d
+status: experimental
+description: |
+    Detects queries to domains that were registered within the last 30 days.
+    Newly registered domains are frequently used in phishing and malware
+    campaigns.
+references:
+    - https://attack.mitre.org/techniques/T1583/001/
+author: Security Team
+date: 2025/12/09
+tags:
+    - attack.resource_development
+    - attack.t1583.001
+logsource:
+    category: dns
+    product: any
+detection:
+    selection:
+        # This requires enrichment with domain age data
+        dns.question.registered_domain.age_days|lt: 30
+    condition: selection
+fields:
+    - dns.question.name
+    - dns.question.registered_domain.age_days
+    - source.ip
+falsepositives:
+    - Legitimate new services
+    - Startup companies
+    - Marketing campaigns
+level: low
